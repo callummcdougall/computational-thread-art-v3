@@ -1158,7 +1158,7 @@ class Drawing:
 
         svg = f'<svg width="{int(output_size[1])}" height="{int(output_size[0])}" xmlns="http://www.w3.org/2000/svg" style="background-color: transparent;">{"".join(svg_lines)}</svg>'
 
-        return canvas, svg, all_coords_rescaled, svg
+        return canvas, svg, all_coords_rescaled, bounding_lengths
 
 
 def get_closest_point_on_border(
@@ -1400,6 +1400,7 @@ def make_gcode(
     plot_gcode: bool = False,
     rotate: bool = False,
     pen_height: int = 450,
+    use_borders: bool = False,
     demo: bool = False,  # turn this on and we only print the first 1000 lines, with all pen up & half speed
 ) -> dict[str, list[str]]:
     """
@@ -1499,6 +1500,7 @@ def make_gcode_single(
     border_lengths: dict[str, tuple[int, int]],
     speed: int = 10_000,
     pen_height: int = 400,
+    use_borders: bool = False,
 ) -> dict[tuple[int, int, int], list[str]]:
     """
     Creates G-code for a single tile image. This gets concatenated for multiple tiles.
@@ -1564,19 +1566,22 @@ def make_gcode_single(
     #   (4) Draw (i.e. the coords_list we've already computed for this color)
     #   (5) Raise pen
     #   (6) Move back to origin
+    # Note, we don't bother with the intermediate origin step if we're not using borders (since this was only
+    # a convoluted way to stop us writing over the same region, but now I can raise to 450!)
     for color, coords_list in all_coords_gcode_scale.items():
         border_start, border_end = border_lengths.get(color, (0, 0))
         border_end = len(coords_list) - 1 - border_end
 
         # (1, 2) Raise pen & move to starting position
         gcode[color] = [f"M3S{pen_height} ; raise (before moving to starting position)"]
-        start_xy_seq = return_to_origin(
-            x=coords_list[0, 0],
-            y=coords_list[0, 1],
-            side=2 if color == "bounding_box" else start_end_sides[color]["start"],
-            include_start=False,
-        )[::-1]
-        gcode[color].extend([f"G1 X{x:.3f} Y{y:.3f} F{speed}" for x, y in start_xy_seq])
+        if use_borders:
+            start_xy_seq = return_to_origin(
+                x=coords_list[0, 0],
+                y=coords_list[0, 1],
+                side=2 if color == "bounding_box" else start_end_sides[color]["start"],
+                include_start=False,
+            )[::-1]
+            gcode[color].extend([f"G1 X{x:.3f} Y{y:.3f} F{speed}" for x, y in start_xy_seq])
 
         # (4) Add all the drawing coordinates (this includes step 3 & 5, lowering & raising)
         x = y = None
@@ -1588,13 +1593,14 @@ def make_gcode_single(
                 gcode[color].append(f"M3S{pen_height} ; raise (to end drawing)")
 
         # (6) End the drawing by moving back to the origin
-        end_xy_seq = return_to_origin(
-            x=coords_list[-1, 0],
-            y=coords_list[-1, 1],
-            side=2 if color == "bounding_box" else start_end_sides[color]["end"],
-            include_start=False,
-        )
-        gcode[color].extend([f"G1 X{x:.3f} Y{y:.3f} F{speed}" for x, y in end_xy_seq])
+        if use_borders:
+            end_xy_seq = return_to_origin(
+                x=coords_list[-1, 0],
+                y=coords_list[-1, 1],
+                side=2 if color == "bounding_box" else start_end_sides[color]["end"],
+                include_start=False,
+            )
+            gcode[color].extend([f"G1 X{x:.3f} Y{y:.3f} F{speed}" for x, y in end_xy_seq])
 
         # Filter GCode to remove any duplicates which are adjacent to each other
         duplicate_indices = set(
@@ -1605,11 +1611,18 @@ def make_gcode_single(
 
         # Update normalized coords to reflect the journey to & from the origin (including whether some of the
         # start and end coords were actually pen-up)
-        all_coords_gcode_scale[color] = [
-            (False, np.concatenate([np.array(start_xy_seq), coords_list[:border_start]])),
-            (True, coords_list[border_start:border_end]),
-            (False, np.concatenate([coords_list[border_end:], np.array(end_xy_seq)])),
-        ]
+        if use_borders:
+            all_coords_gcode_scale[color] = [
+                (False, np.concatenate([np.array(start_xy_seq), coords_list[:border_start]])),
+                (True, coords_list[border_start:border_end]),
+                (False, np.concatenate([coords_list[border_end:], np.array(end_xy_seq)])),
+            ]
+        else:
+            all_coords_gcode_scale[color] = [
+                (False, coords_list[:border_start]),
+                (True, coords_list[border_start:border_end]),
+                (False, coords_list[border_end:]),
+            ]
         # print(color, border_start, border_end, border_lengths, len(coords_list))
 
         # Print total time this will take
