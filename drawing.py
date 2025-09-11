@@ -5,7 +5,7 @@ import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Union
 
 import einops
 import numpy as np
@@ -32,6 +32,172 @@ class ShapeType(enum.Enum):
     TRI = enum.auto()
     HEX = enum.auto()
 
+    @property
+    def n_sides(self) -> int | None:
+        if self == ShapeType.CIRCLE:
+            return None
+        elif self == ShapeType.RECT:
+            return 4
+        elif self == ShapeType.TRI:
+            return 3
+        elif self == ShapeType.HEX:
+            return 6
+
+
+@dataclass
+class BezierCurve:
+    """Represents a cubic Bezier curve with its control points."""
+
+    p0: Float[Arr, "2"]  # Start point
+    p1: Float[Arr, "2"]  # First control point
+    p2: Float[Arr, "2"]  # Second control point
+    p3: Float[Arr, "2"]  # End point
+
+    def to_svg_path(self) -> str:
+        """Convert to SVG path command."""
+        return f"M {self.p0[1]:.1f} {self.p0[0]:.1f} C {self.p1[1]:.1f} {self.p1[0]:.1f}, {self.p2[1]:.1f} {self.p2[0]:.1f}, {self.p3[1]:.1f} {self.p3[0]:.1f}"
+
+    @property
+    def line_length(self) -> int:
+        chord_length = np.linalg.norm(self.p3 - self.p0)
+        control_length = (
+            np.linalg.norm(self.p1 - self.p0)
+            + np.linalg.norm(self.p2 - self.p1)
+            + np.linalg.norm(self.p3 - self.p2)
+        )
+        return 1 + max(1, int((chord_length + control_length) / 2))
+
+    def interpolate_points(self, num_steps: int | None = None) -> Float[Arr, "2 n_steps"]:
+        """Interpolate points along the curve for pixel-based operations."""
+        num_steps = num_steps or int(self.line_length)
+        t_values = np.linspace(0, 1, num_steps, endpoint=True)
+        coords = (
+            ((1 - t_values) ** 3)[None, :] * self.p0[:, None]
+            + (3 * (1 - t_values) ** 2 * t_values)[None, :] * self.p1[:, None]
+            + (3 * (1 - t_values) * t_values**2)[None, :] * self.p2[:, None]
+            + (t_values**3)[None, :] * self.p3[:, None]
+        )
+        return coords
+
+    def reversed(self) -> "BezierCurve":
+        return BezierCurve(p0=self.p3, p1=self.p2, p2=self.p1, p3=self.p0)
+
+    def scale(self, scale_factor: float) -> "BezierCurve":
+        return BezierCurve(
+            p0=self.p0 * scale_factor,
+            p1=self.p1 * scale_factor,
+            p2=self.p2 * scale_factor,
+            p3=self.p3 * scale_factor,
+        )
+
+    def offset(self, offset: Float[Arr, "2"]) -> "BezierCurve":
+        return BezierCurve(
+            p0=self.p0 + offset, p1=self.p1 + offset, p2=self.p2 + offset, p3=self.p3 + offset
+        )
+
+
+@dataclass
+class Circle:
+    """Represents a circle with center and radius."""
+
+    center: Float[Arr, "2"]  # Center point
+    radius: float  # Radius
+
+    def to_svg_element(self, color: str = "black") -> str:
+        """Convert to SVG circle element."""
+        return f'<circle cx="{self.center[1]:.1f}" cy="{self.center[0]:.1f}" r="{self.radius:.1f}" stroke="{color}" fill="none"/>'
+
+    @property
+    def line_length(self) -> int:
+        return 1 + max(1, int(2 * np.pi * self.radius))
+
+    def interpolate_points(self, num_steps: int | None = None) -> Float[Arr, "2 n_steps"]:
+        """Interpolate points around the circle for pixel-based operations."""
+        num_steps = num_steps or int(self.line_length)
+        angles = np.linspace(0, 2 * np.pi, num_steps, endpoint=False)
+        coords = self.center[:, None] + self.radius * np.array([np.cos(angles), np.sin(angles)])
+        return coords
+
+    def scale(self, scale_factor: float) -> "Circle":
+        return Circle(center=self.center * scale_factor, radius=self.radius * scale_factor)
+
+    def offset(self, offset: Float[Arr, "2"]) -> "Circle":
+        return Circle(center=self.center + offset, radius=self.radius)
+
+
+@dataclass
+class PiecewiseLinear:
+    """Represents a piecewise linear shape (polygons, straight lines, etc.) with coordinates."""
+
+    coords: Float[Arr, "2 n_points"]  # Array of points
+
+    def to_svg_path(self) -> str:
+        """Convert to SVG path command for piecewise linear shape."""
+        if self.coords.shape[1] == 0:
+            return ""
+
+        # Start with move command
+        path = f"M {self.coords[1, 0]:.1f} {self.coords[0, 0]:.1f}"
+
+        # Add line commands for each subsequent point
+        for i in range(1, self.coords.shape[1]):
+            path += f" L {self.coords[1, i]:.1f} {self.coords[0, i]:.1f}"
+
+        return path
+
+    @property
+    def line_length(self) -> int:
+        return sum(
+            np.linalg.norm(self.coords[:, i + 1] - self.coords[:, i])
+            for i in range(self.coords.shape[1] - 1)
+        )
+
+    def interpolate_points(self, num_steps: int | None = None) -> Float[Arr, "2 n_steps"]:
+        """Vectorized interpolation for piecewise linear shapes."""
+        if self.coords.shape[1] == 0:
+            return np.empty((2, 0))
+
+        # For piecewise linear, we can interpolate along the total length
+        num_steps = num_steps or int(self.line_length)
+
+        # Pre-calculate segment information using vectorized operations
+        segment_vectors = np.diff(self.coords, axis=1)  # Direction vectors
+        segment_lengths = np.linalg.norm(segment_vectors, axis=0)  # Lengths
+        segment_starts = self.coords[:, :-1]  # Start points of each segment
+
+        # Generate parameter values along the total length
+        t_values = np.linspace(0, segment_lengths.sum(), num_steps, endpoint=True)
+
+        # Pre-calculate cumulative segment lengths for efficient lookup
+        cumulative_lengths = np.concatenate([[0], np.cumsum(segment_lengths)])
+
+        # Find which segment each t value belongs to using vectorized operations
+        # Use searchsorted for efficient binary search instead of linear search
+        segment_indices = np.searchsorted(cumulative_lengths[1:], t_values, side="right")
+        segment_indices = np.clip(segment_indices, 0, len(segment_lengths) - 1)
+
+        # Calculate local t values within each segment
+        local_t_values = t_values - cumulative_lengths[segment_indices]
+        segment_t_values = local_t_values / segment_lengths[segment_indices]
+
+        # Vectorized interpolation: start_point + t * (end_point - start_point)
+        start_points = segment_starts[:, segment_indices]
+        end_points = self.coords[:, segment_indices + 1]
+
+        # Expand segment_t_values for broadcasting
+        segment_t_values_expanded = segment_t_values[None, :]
+
+        # Vectorized linear interpolation
+        interpolated_points = start_points + segment_t_values_expanded * (end_points - start_points)
+
+        return interpolated_points
+
+    def scale(self, scale_factor: float) -> "PiecewiseLinear":
+        return PiecewiseLinear(coords=self.coords * scale_factor)
+
+    def offset(self, offset: Float[Arr, "2"]) -> "PiecewiseLinear":
+        return PiecewiseLinear(coords=self.coords + offset[:, None])
+
 
 @dataclass
 class Shape:
@@ -44,23 +210,22 @@ class Shape:
     character_path: str | None = None
 
     # Not parameter-specific
-    max_out_of_bounds: int | None = None  # No lines are allowed to go more than this far out of bounds, at any point
+    max_out_of_bounds: int | None = (
+        None  # No lines are allowed to go more than this far out of bounds, at any point
+    )
 
-    # * Used for shapes and lines (not characters)
-    size_range: tuple[float, float] = (0.05, 0.15)  # size range (means smth different for arcs)
+    # Used for shapes and lines (not characters)
+    size_range: tuple[float, float] = (0.05, 0.15)  # size range
 
-    # * Only used for lines
-    endpoint_angle_range: tuple[float, float] = (np.pi * 0.2, np.pi * 0.6)
-    # ^ absolute value of angle change (shouldn't be zero because then arc is just a straight line)
-    bezier_control_factor_range: tuple[float, float] = (0.4, 0.6)
-    # ^ not exactly sure yet what effect this has
-    bezier_end_angle_range: tuple[float, float] = (-np.pi * 0.6, np.pi * 0.6)
-    # ^ direction we end by pointing in (relative to what it would be if we just went straight)
+    # Only used for lines
+    endpoint_angle_range: tuple[float, float] = (np.pi * 0.2, np.pi * 0.6)  # zero is boring!
+    bezier_control_factor_range: tuple[float, float] = (0.4, 0.6)  # curviness ratios
+    bezier_end_angle_range: tuple[float, float] = (-np.pi * 0.6, np.pi * 0.6)  # can be zero
 
     def __post_init__(self):
-        assert sum(x is not None for x in [self.shape_type, self.character_path, self.line_type]) == 1, (
-            "Must specify one of shape_type, character_path, or line_type"
-        )
+        assert (
+            sum(x is not None for x in [self.shape_type, self.character_path, self.line_type]) == 1
+        ), "Must specify one of shape_type, character_path, or line_type"
         if self.line_type is not None:
             assert self.shape_type is None, "Can't specify both line_type and shape_type"
             assert self.character_path is None, "Can't specify both line_type and character_path"
@@ -70,8 +235,8 @@ class Shape:
 
     def get_random_params(
         self,
-        start_coords: Float[Arr, "2"],
-        start_dir: Float[Arr, "2"],
+        start_coords: Float[Arr, "2"] | None,
+        start_dir: Float[Arr, "2"] | None,
         canvas_length: float,
         end_coords: Float[Arr, "2"] | None = None,
     ) -> dict:
@@ -83,19 +248,23 @@ class Shape:
 
         # Non-line shapes have a single free parameter: size
         elif self.shape_type is not None:
-            return {"size": np.random.randint(*self.size_range)}
+            return {"size": np.random.uniform(*self.size_range)}
 
-        # Arcs have many free parameters!
         else:
             # Get angles. The end angle represents the angle we're moving in the direction of, if we moved
             # straight from start to end (which is why it's close to `start_angle`).
             start_angle = np.arctan2(*start_dir)
-            angle_delta = np.random.uniform(*self.endpoint_angle_range) * (1 if np.random.rand() < 0.5 else -1)
+            angle_delta = np.random.uniform(*self.endpoint_angle_range) * (
+                1 if np.random.rand() < 0.5 else -1
+            )
             end_angle = start_angle + angle_delta
 
             # Get end point
             if end_coords is None:
-                radius = np.random.rand() * (self.size_range[1] - self.size_range[0]) + self.size_range[0]
+                radius = (
+                    np.random.rand() * (self.size_range[1] - self.size_range[0])
+                    + self.size_range[0]
+                )
                 radius *= canvas_length
                 end_coords_delta = radius * np.array([np.sin(end_angle), np.cos(end_angle)])
                 end_coords = start_coords + end_coords_delta
@@ -114,21 +283,25 @@ class Shape:
     def get_drawing_coords_list(
         self,
         n_shapes: int,
-        start_dir: Float[Arr, "2"],
-        start_coords: Float[Arr, "2"],
+        start_dir: Float[Arr, "2"] | None,
+        start_coords: Float[Arr, "2"] | None,
         canvas_y: int,
         canvas_x: int,
         outer_bound: float | None,
         inner_bound: float | None,
         end_coords: Float[Arr, "2"] | None = None,
         max_n_repeats_without_valid_line: int = 100,
-    ) -> list[tuple[Float[Arr, "2 n_pixels"], Float[Arr, "2 n_pixels"], Float[Arr, "2"]],]:
+    ) -> list[
+        tuple[
+            Union[BezierCurve, Circle, PiecewiseLinear], Float[Arr, "2 n_pixels"], Float[Arr, "2"]
+        ],
+    ]:
         """Generates `n_shapes` random shapes, and returns a list of their coords.
 
         Args:
             n_shapes: Number of shapes to generate
-            start_dir: Direction to start the shape in
-            start_coords: Coordinates to start the shape at
+            start_dir: Direction to start the shape in (None for shapes)
+            start_coords: Coordinates to start the shape at (None for shapes)
             canvas_y: Height of the canvas
             canvas_x: Width of the canvas
             outer_bound: Max value out of bounds we allow ANY pixel to be
@@ -139,14 +312,11 @@ class Shape:
         Returns:
             List of the following:
             - params: Dictionary of parameters used to generate the shape
-            - coords: (2, n_pixels) array of float coordinates for the shape
+            - coords: (2, n_pixels) array of float coordinates for the shape OR BezierCurve object
             - coords_uncropped: (2, n_pixels) without cropping at sides (useful for final drawing)
             - pixels: (2, n_pixels) array of integer (y, x) coordinates for the shape
         """
         canvas_length = max(canvas_x, canvas_y)
-
-        if self.line_type is None:
-            raise NotImplementedError("Only doing lines for now (take commented code at the end)")
 
         coords_list = []
         counter = 0
@@ -155,16 +325,23 @@ class Shape:
             # Get random parameterization for this shape
             params = self.get_random_params(start_coords, start_dir, canvas_length, end_coords)
 
-            # We ignore the start coords and randomize them, if this isn't an arc
-            if self.line_type is None:
-                start_coords = np.random.rand(2) * np.array([canvas_x, canvas_y])
+            # For shapes, we ignore the start coords and randomize them
+            if self.shape_type is not None:
+                # Random position for shapes
+                shape_start_coords = np.random.rand(2) * np.array([canvas_y, canvas_x])
+            else:
+                # Use provided start coords for lines
+                shape_start_coords = start_coords
 
-            # Get the actual coordinates for this shape
-            coords_uncropped, _, end_dir = self.draw_curve(start_coords, start_dir, **params)
+            # Get the actual coordinates for this shape (interpolating with step size of 1)
+            coords_uncropped, _, end_dir = self.draw_curve(
+                shape_start_coords, start_dir, canvas_y=canvas_y, canvas_x=canvas_x, **params
+            )
+            interpolated_coords = coords_uncropped.interpolate_points()
 
             # Crop parts of `coords` which go off the edge, and only keep ones which are in bounds anywhere
             coords = mask_coords(
-                coords_uncropped,
+                interpolated_coords,
                 canvas_y,
                 canvas_x,
                 outer_bound=outer_bound if end_coords is None else None,
@@ -172,7 +349,7 @@ class Shape:
                 remove=True,
             )
             if coords.shape[-1] > 0:
-                coords_list.append((coords, coords_uncropped, end_dir))
+                coords_list.append((coords_uncropped, coords, end_dir))
 
             counter += 1
             if counter / (len(coords_list) + 10) > max_n_repeats_without_valid_line:
@@ -185,21 +362,29 @@ class Shape:
     def draw_curve(
         self,
         start_coords: Float[Arr, "2"],
-        start_dir: Float[Arr, "2"],
-        end_coords: Float[Arr, "2"],
+        start_dir: Float[Arr, "2"] | None,
+        canvas_y: int | None = None,
+        canvas_x: int | None = None,
+        end_coords: Float[Arr, "2"] | None = None,
         **kwargs,
-    ) -> tuple[Float[Arr, "2 n_pixels"], Int[Arr, "2 n_pixels"], Float[Arr, "2"]]:
+    ) -> tuple[
+        Union[BezierCurve, Circle, PiecewiseLinear], Int[Arr, "2 n_pixels"], Float[Arr, "2"]
+    ]:
         """
-        Draw arc or Bezier curve and return interpolated pixel coordinates.
+        Draw arc, Bezier curve, or shape and return interpolated pixel coordinates.
 
         Args:
             start_coords: (y, x) starting coordinates as floats
-            start_dir: normalized (y, x) direction vector
+            start_dir: normalized (y, x) direction vector (None for shapes)
+            canvas_y: Height of the canvas (required for shapes)
+            canvas_x: Width of the canvas (required for shapes)
+            end_coords: (y, x) ending coordinates as floats (None for shapes)
             **kwargs: For 'arc': radius, angle, orientation (True=anticlockwise)
                     For 'bezier': end_coords, start_length, end_length, end_dir
+                    For 'shape': size
 
         Returns:
-            coords: (2, num_pixels) array of float coordinates
+            coords: (2, num_pixels) array of float coordinates OR BezierCurve object
             pixels: (2, num_pixels) array of integer (y, x) coordinates
             final_dir: (2,) array with final normalized (y, x) direction
         """
@@ -208,17 +393,95 @@ class Shape:
         # - Final direction
         # - Function which interpolates the curve in the region [0, 1]
 
-        if self.line_type == LineType.STRAIGHT:
+        if self.shape_type is not None:
+            # Handle shapes
+            assert "size" in kwargs
+            assert canvas_y is not None and canvas_x is not None, (
+                "Canvas dimensions required for shapes"
+            )
+            size = kwargs["size"]
+
+            # Calculate shape size in pixels
+            canvas_length = max(canvas_y, canvas_x)  # Use actual canvas dimensions
+            shape_size = size * canvas_length
+
+            if self.shape_type == ShapeType.CIRCLE:
+                # Generate circle object
+                radius = shape_size / 2
+                center = start_coords
+                coords = Circle(center=center, radius=radius)
+                final_dir = np.array([1.0, 0.0])  # Arbitrary direction for shapes
+
+            elif self.shape_type == ShapeType.RECT:
+                # Generate square coordinates
+                half_size = shape_size / 2
+                center = start_coords
+                # Square vertices: top-left, top-right, bottom-right, bottom-left, back to top-left
+                square_coords = np.array(
+                    [
+                        [-half_size, -half_size],  # top-left
+                        [half_size, -half_size],  # top-right
+                        [half_size, half_size],  # bottom-right
+                        [-half_size, half_size],  # bottom-left
+                        [-half_size, -half_size],  # back to start
+                    ]
+                ).T
+                coords = PiecewiseLinear(coords=center[:, None] + square_coords)
+                final_dir = np.array([1.0, 0.0])
+
+            elif self.shape_type == ShapeType.TRI:
+                # Generate equilateral triangle coordinates
+                half_width = shape_size / 2
+                height = half_width * np.sqrt(3)  # Height of equilateral triangle
+                center = start_coords
+                # Triangle vertices: bottom-left, bottom-right, top, back to bottom-left
+                triangle_coords = np.array(
+                    [
+                        [-half_width, -height / 3],  # bottom-left
+                        [half_width, -height / 3],  # bottom-right
+                        [0, 2 * height / 3],  # top
+                        [-half_width, -height / 3],  # back to start
+                    ]
+                ).T
+                coords = PiecewiseLinear(coords=center[:, None] + triangle_coords)
+                final_dir = np.array([1.0, 0.0])
+
+            elif self.shape_type == ShapeType.HEX:
+                # Generate regular hexagon coordinates (rotated so corners are left/right)
+                half_width = shape_size / 2
+                height = half_width * np.sqrt(3)  # Height of regular hexagon
+                center = start_coords
+                # Hexagon vertices: going clockwise from leftmost point (rotated 90 degrees)
+                hex_coords = np.array(
+                    [
+                        [0, -half_width],  # left
+                        [-height / 2, -half_width / 2],  # bottom-left
+                        [-height / 2, half_width / 2],  # bottom-right
+                        [0, half_width],  # right
+                        [height / 2, half_width / 2],  # top-right
+                        [height / 2, -half_width / 2],  # top-left
+                        [0, -half_width],  # back to start
+                    ]
+                ).T
+                coords = PiecewiseLinear(coords=center[:, None] + hex_coords)
+                final_dir = np.array([1.0, 0.0])
+            else:
+                raise ValueError(f"Unsupported shape type: {self.shape_type}")
+
+        elif self.line_type == LineType.STRAIGHT:
             assert set(kwargs.keys()) == set()
 
-            line_length = np.linalg.norm(end_coords - start_coords)
-
-            interpolate = lambda t: start_coords[:, None] + t * (end_coords - start_coords)[:, None]
+            # Create PiecewiseLinear object for straight line & end direction
+            coords = PiecewiseLinear(coords=np.column_stack([start_coords, end_coords]))
             final_dir = start_dir
 
         elif self.line_type == LineType.BEZIER:
             assert set(kwargs.keys()) == {"start_strength", "end_strength", "end_dir"}
-            start_strength, end_strength, end_dir = kwargs["start_strength"], kwargs["end_strength"], kwargs["end_dir"]
+            start_strength, end_strength, end_dir = (
+                kwargs["start_strength"],
+                kwargs["end_strength"],
+                kwargs["end_dir"],
+            )
 
             # Get chord length, to be used for computing control points
             chord = end_coords - start_coords
@@ -234,30 +497,18 @@ class Shape:
             p2 = np.array(end_coords) - end_strength * chord_length * end_dir
             p3 = np.array(end_coords)
 
-            # Estimate curve length and steps: avg of direct path and control points piecewise linear path
-            chord_length = np.linalg.norm(p3 - p0)
-            control_length = np.linalg.norm(p1 - p0) + np.linalg.norm(p2 - p1) + np.linalg.norm(p3 - p2)
-            line_length = (chord_length + control_length) / 2
-
-            # Generate Bezier points
-            interpolate = lambda t: (
-                ((1 - t) ** 3) * p0[:, None]
-                + (3 * (1 - t) ** 2 * t) * p1[:, None]
-                + (3 * (1 - t) * t**2) * p2[:, None]
-                + (t**3) * p3[:, None]
-            )
+            # Create BezierCurve object & end direction
+            coords = BezierCurve(p0=p0, p1=p1, p2=p2, p3=p3)
             final_dir = np.array(end_dir)
 
         else:
             raise ValueError(f"Invalid line type: {self.line_type}")
 
-        # Using the interpolation function, we get coords for each step along the curve (using
-        # line length to determine the number of steps we interpolate along)
-        num_steps = 1 + max(1, int(line_length))
-        coords = interpolate(np.linspace(0, 1, num_steps, endpoint=True))
+        # For all shape types, we need to interpolate points for pixel generation
+        coords_interpolated = coords.interpolate_points()
 
         # Round to pixels and normalize final direction
-        pixels = np.round(coords).astype(int)
+        pixels = np.round(coords_interpolated).astype(int)
         pixels = np.unique(pixels, axis=1)
         final_dir = final_dir / np.linalg.norm(final_dir)
 
@@ -287,14 +538,18 @@ class TargetImage:
                 color: Image.open(img_path).convert("L" if len(self.palette) == 1 else "RGB")
                 for color, img_path in self.image_path.items()
             }
-            assert len(set(i.size for i in image.values())) == 1, "All images must have the same size"
+            assert len(set(i.size for i in image.values())) == 1, (
+                "All images must have the same size"
+            )
             width, height = image.values()[0].size
 
         # Optionally load in (and turn to an array) the weight image
         self.weight_image = None
         if self.weight_image_path is not None:
             weight_image = Image.open(self.weight_image_path).convert("L")
-            self.weight_image = np.asarray(weight_image.resize((self.x, self.y))).astype(np.float32) / 255
+            self.weight_image = (
+                np.asarray(weight_image.resize((self.x, self.y))).astype(np.float32) / 255
+            )
 
         # Get dimensions (for target and output images)
         self.y = int(self.x * height / width)
@@ -303,7 +558,9 @@ class TargetImage:
         # Optionally perform dithering, and get `self.image_dict` for use in `Drawing`
         if len(self.palette) == 1:
             # Case 1: basic monochrome image (only black lines)
-            assert isinstance(image, Image.Image), "Image must be a single image if there is only one color"
+            assert isinstance(image, Image.Image), (
+                "Image must be a single image if there is only one color"
+            )
             image_arr = np.asarray(image.resize((self.x, self.y)))
             self.image_dict = {self.palette[0]: 1.0 - image_arr.astype(np.float32) / 255}
         elif isinstance(image, dict):
@@ -321,22 +578,29 @@ class TargetImage:
             image_arr = np.asarray(image.resize((self.x, self.y)))
             image_dithered = FS_dither(image_arr, [(255, 255, 255)] + self.palette)
             self.image_dict = {
-                color: (get_img_hash(image_dithered) == get_color_hash(np.array(color))).astype(np.float32)
+                color: (get_img_hash(image_dithered) == get_color_hash(np.array(color))).astype(
+                    np.float32
+                )
                 for color in self.palette
             }
             if self.blur_rad is not None:
-                self.image_dict = {color: blur_image(img, self.blur_rad) for color, img in self.image_dict.items()}
+                self.image_dict = {
+                    color: blur_image(img, self.blur_rad) for color, img in self.image_dict.items()
+                }
 
             nonwhite_density_sum = sum(
                 [img.sum() for color, img in self.image_dict.items() if color != (255, 255, 255)]
             )
             for color, img in self.image_dict.items():
-                print(f"{get_color_string(color)}, density = {img.sum() / nonwhite_density_sum:.4f}")
+                print(
+                    f"{get_color_string(color)}, density = {img.sum() / nonwhite_density_sum:.4f}"
+                )
 
         # Display the images for each color (again we split based on whether the input was a string or dictionary)
         if self.display_dithered:
             background_colors = [
-                np.array([255, 255, 255]) if sum(color) < 255 + 160 else np.array([0, 0, 0]) for color in self.palette
+                np.array([255, 255, 255]) if sum(color) < 255 + 160 else np.array([0, 0, 0])
+                for color in self.palette
             ]
             dithered_images = np.concatenate(
                 [
@@ -385,7 +649,13 @@ class Drawing:
         seed: int = 0,
         use_borders: bool = False,
         name: str | None = None,
-    ) -> tuple[Image.Image, dict[str, Float[Arr, "n_pixels 2"]], tuple[int, int]]:
+    ) -> tuple[
+        Image.Image,
+        dict[
+            str, Union[Float[Arr, "n_pixels 2"], list[Union[BezierCurve, Circle, PiecewiseLinear]]]
+        ],
+        tuple[int, int],
+    ]:
         np.random.seed(seed)
 
         # If any parameters were given as a single number, convert them to lists
@@ -393,13 +663,17 @@ class Drawing:
             self.darkness = [self.darkness] * len(self.target.palette)
         if isinstance(self.n_shapes, int):
             self.n_shapes = [self.n_shapes]
-        assert len(self.n_shapes) == len(self.target.palette), "Should give num shapes for each color"
+        assert len(self.n_shapes) == len(self.target.palette), (
+            "Should give num shapes for each color"
+        )
 
         # Create dicts to store coords for each color
         all_coords = {}
         all_start_end_positions = {}  # TODO - this is redundant if I can get start/end posns/dirs from `coords`?
 
-        for color, n_shapes, darkness in zip(self.target.palette, self.n_shapes, self.darkness, strict=True):
+        for color, n_shapes, darkness in zip(
+            self.target.palette, self.n_shapes, self.darkness, strict=True
+        ):
             if n_shapes == 0:
                 continue
 
@@ -412,7 +686,9 @@ class Drawing:
             if use_borders:
                 blurred_image = blur_image(image, rad=5, mode="linear")
                 pixels_are_dark = blurred_image > 0.8 * blurred_image.max()
-                pixels_mesh = np.stack(np.meshgrid(np.arange(self.target.y), np.arange(self.target.x)), axis=-1)
+                pixels_mesh = np.stack(
+                    np.meshgrid(np.arange(self.target.y), np.arange(self.target.x)), axis=-1
+                )
                 pixel_distances_from_border = np.stack(
                     [
                         pixels_mesh[:, :, 0],
@@ -424,7 +700,9 @@ class Drawing:
                 valid_pixel_distances_from_border = np.where(
                     pixels_are_dark, pixel_distances_from_border.min(axis=0), np.inf
                 )
-                start_coords = np.stack(np.unravel_index(np.argmin(valid_pixel_distances_from_border), image.shape))
+                start_coords = np.stack(
+                    np.unravel_index(np.argmin(valid_pixel_distances_from_border), image.shape)
+                )
             else:
                 start_coords = np.stack(np.unravel_index(np.argmax(image), image.shape))
 
@@ -442,15 +720,60 @@ class Drawing:
                 )
 
                 # Subtract it from the target image, and write it to the canvas
-                best_pixels = best_coords.astype(np.int32)
+                # For all shape types, we need to interpolate points for pixel operations
+                if isinstance(best_coords, (BezierCurve, Circle, PiecewiseLinear)):
+                    # Estimate length for interpolation
+                    if isinstance(best_coords, BezierCurve):
+                        chord_length = np.linalg.norm(best_coords.p3 - best_coords.p0)
+                        control_length = (
+                            np.linalg.norm(best_coords.p1 - best_coords.p0)
+                            + np.linalg.norm(best_coords.p2 - best_coords.p1)
+                            + np.linalg.norm(best_coords.p3 - best_coords.p2)
+                        )
+                        line_length = (chord_length + control_length) / 2
+                    elif isinstance(best_coords, Circle):
+                        line_length = 2 * np.pi * best_coords.radius
+                    else:  # PiecewiseLinear
+                        total_length = 0
+                        for i in range(best_coords.coords.shape[1] - 1):
+                            total_length += np.linalg.norm(
+                                best_coords.coords[:, i + 1] - best_coords.coords[:, i]
+                            )
+                        line_length = total_length
+
+                    num_steps = 1 + max(1, int(line_length))
+                    best_pixels = best_coords.interpolate_points(num_steps)
+                    best_pixels = np.round(best_pixels).astype(np.int32)
+                    best_pixels = best_pixels[
+                        :,
+                        (best_pixels >= 0).all(axis=0)
+                        & (best_pixels < np.array(image.shape)[:, None]).all(axis=0),
+                    ]
+                    best_pixels = np.unique(best_pixels, axis=1)
+                else:
+                    best_pixels = best_coords.astype(np.int32)
+
                 image[best_pixels[0], best_pixels[1]] -= darkness
-                all_coords[color_string].append(best_coords_uncropped)
+                # all_coords[color_string].append(best_coords_uncropped)
+                all_coords[color_string].append(best_coords)
 
-                # This end dir is the new start dir (same for position)
-                current_coords = best_coords[:, -1]
-                current_dir = best_end_dir
+                # For shapes, each shape is independent (no connection between shapes)
+                # For lines, this end dir is the new start dir (same for position)
+                if self.shape.shape_type is None:
+                    if isinstance(best_coords, (BezierCurve, Circle, PiecewiseLinear)):
+                        if isinstance(best_coords, BezierCurve):
+                            current_coords = best_coords.p3  # End point of Bezier curve
+                        elif isinstance(best_coords, Circle):
+                            # For circles, we don't really have an "end point", so we'll use the center
+                            current_coords = best_coords.center
+                        else:  # PiecewiseLinear
+                            current_coords = best_coords.coords[
+                                :, -1
+                            ]  # Last point of coordinate array
+                    else:
+                        current_coords = best_coords[:, -1]  # Last point of coordinate array
+                    current_dir = best_end_dir
 
-            all_coords[color_string] = np.concatenate(all_coords[color_string], axis=1).T  # shape (n_pixels, 2)
             all_start_end_positions[color_string] = {
                 "start_coords": start_coords,
                 "start_dir": start_dir,
@@ -462,12 +785,14 @@ class Drawing:
         if self.zoom_fractions is not None:
             zoom_pixels_y = int(self.target.y * self.zoom_fractions[0])
             zoom_pixels_x = int(self.target.x * self.zoom_fractions[1])
+            offset = np.array([zoom_pixels_y, zoom_pixels_x])
             for color in self.target.palette:
                 color_string = get_color_string(color)
                 # Offset coords
-                all_coords[color_string] += np.array([zoom_pixels_y, zoom_pixels_x])
-                all_start_end_positions[color_string]["start_coords"] += np.array([zoom_pixels_y, zoom_pixels_x])
-                all_start_end_positions[color_string]["end_coords"] += np.array([zoom_pixels_y, zoom_pixels_x])
+                for shape in all_coords[color_string]:
+                    shape = shape.offset(offset)
+                all_start_end_positions[color_string]["start_coords"] += offset
+                all_start_end_positions[color_string]["end_coords"] += offset
                 # Pad image with zeros
                 self.target.image_dict[color] = np.pad(
                     self.target.image_dict[color],
@@ -499,7 +824,13 @@ class Drawing:
                     )[1],
                     use_bounds=False,
                 )
-                all_coords[color_string] = np.concatenate([best_coords_start[:, ::-1].T, all_coords[color_string]])
+
+                # Handle the start shape coordinates (Bezier curves need to be reversed)
+                coords = [
+                    best_coords_start.reversed()
+                    if isinstance(best_coords_start, BezierCurve)
+                    else best_coords_start
+                ] + (coords if isinstance(coords, list) else [coords])
 
                 # Get end shape: starting from the end position and moving to the closest border
                 best_coords_end, _, _ = self.get_best_shape(
@@ -511,19 +842,37 @@ class Drawing:
                     )[1],
                     use_bounds=False,
                 )
-                all_coords[color_string] = np.concatenate([all_coords[color_string], best_coords_end.T], axis=0)
-                border_lengths[color_string] = (best_coords_start.shape[1], best_coords_end.shape[1])
+
+                # Handle the end shape coordinates
+                if isinstance(best_coords_end, (BezierCurve, Circle, PiecewiseLinear)):
+                    coords = coords + [best_coords_end]
+                else:
+                    coords = np.concatenate([coords, best_coords_end.T], axis=0)
+
+                all_coords[color_string] = coords
+
+                if isinstance(best_coords_start, (BezierCurve, Circle, PiecewiseLinear)):
+                    border_lengths[color_string] = (1, 1)  # One shape each
+                else:
+                    border_lengths[color_string] = (
+                        best_coords_start.shape[1],
+                        best_coords_end.shape[1],
+                    )
 
                 # Test: are the min coord distances very small, and are the start/end coords on the border?
-                diffs = np.diff(all_coords[color_string], axis=0)
-                min_diff = np.min(np.linalg.norm(diffs, axis=1))
-                assert min_diff < 1.0, f"Found unexpectedly large coord diffs: {min_diff:.3f}"
-                for coord in [all_coords[color_string][0], all_coords[color_string][-1]]:
-                    _, border_coord = get_closest_point_on_border(coord, target_y, target_x)
-                    border_coord_diff = np.linalg.norm(coord - border_coord)
-                    assert border_coord_diff < 3.0, (
-                        f"Found unexpected coord: {coord} with diff to border {border_coord} of {border_coord_diff:.3f}"
-                    )
+                if isinstance(coords, list):
+                    # For Bezier curves, we can't easily test this without interpolating
+                    pass
+                else:
+                    diffs = np.diff(coords, axis=0)
+                    min_diff = np.min(np.linalg.norm(diffs, axis=1))
+                    assert min_diff < 1.0, f"Found unexpectedly large coord diffs: {min_diff:.3f}"
+                    for coord in [coords[0], coords[-1]]:
+                        _, border_coord = get_closest_point_on_border(coord, target_y, target_x)
+                        border_coord_diff = np.linalg.norm(coord - border_coord)
+                        assert border_coord_diff < 3.0, (
+                            f"Found unexpected coord: {coord} with diff to border {border_coord} of {border_coord_diff:.3f}"
+                        )
         else:
             border_lengths = {color_string: (0, 0) for color_string in all_coords.keys()}
 
@@ -535,7 +884,35 @@ class Drawing:
             canvas.save(f"outputs_drawing/{name}.png")
             with open(f"outputs_drawing/{name}.svg", "w") as f:
                 f.write(svg)
-            np.savez(f"outputs_drawing/{name}.npz", **all_coords)
+            # Save coordinates - for shape objects, we need to handle them differently
+            if isinstance(next(iter(all_coords.values())), list):
+                # Convert shape objects to a format that can be saved
+                save_coords = {}
+                for color_string, shapes in all_coords.items():
+                    save_coords[color_string] = {
+                        "shapes": [
+                            {
+                                "type": type(shape).__name__,
+                                "data": {
+                                    "p0": shape.p0.tolist() if hasattr(shape, "p0") else None,
+                                    "p1": shape.p1.tolist() if hasattr(shape, "p1") else None,
+                                    "p2": shape.p2.tolist() if hasattr(shape, "p2") else None,
+                                    "p3": shape.p3.tolist() if hasattr(shape, "p3") else None,
+                                    "center": shape.center.tolist()
+                                    if hasattr(shape, "center")
+                                    else None,
+                                    "radius": shape.radius if hasattr(shape, "radius") else None,
+                                    "coords": shape.coords.tolist()
+                                    if hasattr(shape, "coords")
+                                    else None,
+                                },
+                            }
+                            for shape in shapes
+                        ]
+                    }
+                np.savez(f"outputs_drawing/{name}.npz", **save_coords)
+            else:
+                np.savez(f"outputs_drawing/{name}.npz", **all_coords)
             json.dump(
                 {"border_lengths": border_lengths, "target_y": target_y, "target_x": target_x},
                 open(f"outputs_drawing/{name}.json", "w"),
@@ -550,7 +927,9 @@ class Drawing:
         start_coords: Float[Arr, "2"],
         end_coords: Float[Arr, "2"] | None = None,
         use_bounds: bool = True,
-    ) -> tuple[Float[Arr, "2 n_pixels"], Float[Arr, "2 n_pixels"], Float[Arr, "2"]]:
+    ) -> tuple[
+        Union[BezierCurve, Circle, PiecewiseLinear], Float[Arr, "2 n_pixels"], Float[Arr, "2"]
+    ]:
         # Get our random parameterized shapes
 
         coords_list = self.shape.get_drawing_coords_list(
@@ -565,8 +944,42 @@ class Drawing:
         )
 
         # Turn them into integer pixels, and concat them
-        pixels = [coords.astype(np.int32) for coords, _, _ in coords_list]
-        n_pixels = [coords.shape[-1] for coords, _, _ in coords_list]
+        pixels = []
+        n_pixels = []
+        for coords, _, _ in coords_list:
+            if isinstance(coords, (BezierCurve, Circle, PiecewiseLinear)):
+                # For shape objects, interpolate points for pixel operations
+                if isinstance(coords, BezierCurve):
+                    chord_length = np.linalg.norm(coords.p3 - coords.p0)
+                    control_length = (
+                        np.linalg.norm(coords.p1 - coords.p0)
+                        + np.linalg.norm(coords.p2 - coords.p1)
+                        + np.linalg.norm(coords.p3 - coords.p2)
+                    )
+                    line_length = (chord_length + control_length) / 2
+                elif isinstance(coords, Circle):
+                    line_length = 2 * np.pi * coords.radius
+                else:  # PiecewiseLinear
+                    total_length = 0
+                    for i in range(coords.coords.shape[1] - 1):
+                        total_length += np.linalg.norm(
+                            coords.coords[:, i + 1] - coords.coords[:, i]
+                        )
+                    line_length = total_length
+
+                num_steps = 1 + max(1, int(line_length))
+                interpolated_coords = coords.interpolate_points(num_steps)
+                interpolated_coords = interpolated_coords[
+                    :,
+                    (interpolated_coords >= 0).all(axis=0)
+                    & (interpolated_coords < np.array(image.shape)[:, None]).all(axis=0),
+                ].astype(np.int32)
+                pixels.append(interpolated_coords)
+                n_pixels.append(interpolated_coords.shape[1])
+            else:
+                pixels.append(coords.astype(np.int32))
+                n_pixels.append(coords.shape[1])
+
         pixels = np.stack([pad_to_length(p, max(n_pixels)) for p in pixels])  # (n_rand, 2, n_pix)
 
         # Get the pixels values of the target image at these coords
@@ -583,7 +996,9 @@ class Drawing:
             pixel_values_mask = pixel_values_mask.astype(pixel_values.dtype) * pixel_weights
 
         # Average over each pixel array
-        pixel_values = (pixel_values * pixel_values_mask).sum(-1) / (pixel_values_mask.sum(-1) + 1e-8)
+        pixel_values = (pixel_values * pixel_values_mask).sum(-1) / (
+            pixel_values_mask.sum(-1) + 1e-8
+        )
 
         # Pick the darkest shape to draw
         best_idx = np.argmax(pixel_values)
@@ -591,7 +1006,9 @@ class Drawing:
 
     def make_canvas_and_crop_coords(
         self,
-        all_coords: dict[str, Float[Arr, "n_pixels 2"]],
+        all_coords: dict[
+            str, Union[Float[Arr, "n_pixels 2"], list[Union[BezierCurve, Circle, PiecewiseLinear]]]
+        ],
         target_y: int,
         target_x: int,
         bounding_x: tuple[float, float] = (0.0, 1.0),
@@ -599,9 +1016,11 @@ class Drawing:
         fractions: float | dict[str, float] | None = None,
     ) -> tuple[Image.Image, dict[str, Float[Arr, "n_pixels 2"]], str]:
         """
-        Function which makes a canvas to display, and at the same time crops coordinates & gives us rescaled
-        coords (in 0-1 range) to be used for GCode generation. Also returns an SVG representation with a transparent background.
+        Function which makes a canvas to display, and at the same time crops coordinates & gives us
+        rescaled coords (in 0-1 range) to be used for GCode generation. Also returns an SVG
+        representation with a transparent background.
         """
+
         all_coords_rescaled = {}
 
         output_x = self.target.output_x
@@ -619,30 +1038,115 @@ class Drawing:
         svg_lines = []
 
         for color_string, coords in all_coords.items():
+            assert isinstance(coords, list), "Should all be lists by now?"
+
             # Possibly crop the coordinates down to a subset of them
             if fractions is not None:
                 fraction = fractions if isinstance(fractions, float) else fractions[color_string]
                 coords = coords[: int(len(coords) * fraction)].copy()
 
-            # Crop the coordinates, so we only get ones that appear inside the bounding box
-            coords_scaled_to_01 = coords / size
-            coords_mask = (coords_scaled_to_01 >= bounding_min) & (coords_scaled_to_01 <= bounding_max)
-            coords = coords[coords_mask.all(axis=-1)]
+            for shape in coords:
+                scaled_shape = shape.scale(output_sf)
+                if isinstance(shape, BezierCurve):
+                    svg_lines.append(
+                        f'<path d="{scaled_shape.to_svg_path()}" stroke="{color_string}" fill="none"/>'
+                    )
 
-            # Take our cropped coordinates, shift them into the bounding box & write to the canvas
-            coords = output_sf * (coords - size * bounding_min)
-            for (y0, x0), (y1, x1) in zip(coords[:-1], coords[1:]):
-                draw.line([(x0, y0), (x1, y1)], fill=color_string, width=1)
-                svg_lines.append(
-                    f'<line x1="{x0:.1f}" y1="{y0:.1f}" x2="{x1:.1f}" y2="{y1:.1f}" stroke="{color_string}" stroke-width="1"/>'
-                )
+                    # For canvas drawing, interpolate points and draw line segments
+                    chord_length = np.linalg.norm(scaled_shape.p3 - scaled_shape.p0)
+                    control_length = (
+                        np.linalg.norm(scaled_shape.p1 - scaled_shape.p0)
+                        + np.linalg.norm(scaled_shape.p2 - scaled_shape.p1)
+                        + np.linalg.norm(scaled_shape.p3 - scaled_shape.p2)
+                    )
+                    line_length = (chord_length + control_length) / 2
+                    num_steps = 1 + max(1, int(line_length))
+                    curve_points = scaled_shape.interpolate_points(num_steps)
 
-            # Rescale coordinates (preserving aspect ratio) to be in the [0, 1] range
-            all_coords_rescaled[color_string] = coords / output_size.max()
+                    # Draw line segments on canvas
+                    for i in range(curve_points.shape[1] - 1):
+                        y0, x0 = curve_points[:, i]
+                        y1, x1 = curve_points[:, i + 1]
+                        draw.line([(x0, y0), (x1, y1)], fill=color_string, width=1)
+
+                elif isinstance(shape, Circle):
+                    svg_lines.append(scaled_shape.to_svg_element(color_string))
+
+                    # For canvas drawing, interpolate points and draw circle
+                    num_steps = 1 + max(1, int(2 * np.pi * scaled_shape.radius))
+                    circle_points = shape.interpolate_points(num_steps)
+                    circle_points = output_sf * (circle_points - (size * bounding_min)[:, None])
+
+                    # Draw circle segments on canvas
+                    for i in range(circle_points.shape[1] - 1):
+                        y0, x0 = circle_points[:, i]
+                        y1, x1 = circle_points[:, i + 1]
+                        draw.line([(x0, y0), (x1, y1)], fill=color_string, width=1)
+
+                elif isinstance(shape, PiecewiseLinear):
+                    # Scale and offset the piecewise linear shape
+                    # scaled_coords = output_sf * (shape.coords - (size * bounding_min)[:, None])
+                    scaled_coords = output_sf * shape.coords
+
+                    # Add SVG path element
+                    scaled_shape = PiecewiseLinear(coords=scaled_coords)
+                    svg_lines.append(
+                        f'<path d="{scaled_shape.to_svg_path()}" stroke="{color_string}" fill="none"/>'
+                    )
+
+                    # For canvas drawing, interpolate points and draw line segments
+                    total_length = 0
+                    for i in range(scaled_coords.shape[1] - 1):
+                        total_length += np.linalg.norm(
+                            scaled_coords[:, i + 1] - scaled_coords[:, i]
+                        )
+                    num_steps = 1 + max(1, int(total_length))
+                    line_points = scaled_shape.interpolate_points(num_steps)
+
+                    # Draw line segments on canvas
+                    for i in range(line_points.shape[1] - 1):
+                        y0, x0 = line_points[:, i]
+                        y1, x1 = line_points[:, i + 1]
+                        draw.line([(x0, y0), (x1, y1)], fill=color_string, width=1)
+
+            # For rescaled coordinates, we need to interpolate all shapes
+            all_shape_points = []
+            for shape in coords:
+                # Estimate length for interpolation
+                if isinstance(shape, BezierCurve):
+                    chord_length = np.linalg.norm(shape.p3 - shape.p0)
+                    control_length = (
+                        np.linalg.norm(shape.p1 - shape.p0)
+                        + np.linalg.norm(shape.p2 - shape.p1)
+                        + np.linalg.norm(shape.p3 - shape.p2)
+                    )
+                    line_length = (chord_length + control_length) / 2
+                elif isinstance(shape, Circle):
+                    line_length = 2 * np.pi * shape.radius
+                else:  # PiecewiseLinear
+                    total_length = 0
+                    for i in range(shape.coords.shape[1] - 1):
+                        total_length += np.linalg.norm(shape.coords[:, i + 1] - shape.coords[:, i])
+                    line_length = total_length
+
+                num_steps = 1 + max(1, int(line_length))
+                shape_points = shape.interpolate_points(num_steps)
+                all_shape_points.append(shape_points.T)  # Transpose to (n_points, 2)
+
+            if all_shape_points:
+                # Concatenate all shape points
+                all_points = np.concatenate(all_shape_points, axis=0)
+                all_coords_rescaled[color_string] = all_points / output_size.max()
+            else:
+                all_coords_rescaled[color_string] = np.empty((0, 2))
 
         # Resize canvas to height 500
         canvas_y = 500
-        canvas_x = 500 * (output_x * (bounding_x[1] - bounding_x[0])) / (output_y * (bounding_y[1] - bounding_y[0]))
+        canvas_x = (
+            500
+            * (output_x * (bounding_x[1] - bounding_x[0]))
+            / (output_y * (bounding_y[1] - bounding_y[0]))
+        )
         canvas = canvas.resize((int(canvas_x), canvas_y))
 
         # Check all_coords_rescaled is within the bounding box
@@ -652,11 +1156,7 @@ class Drawing:
             f"  Bounding box (rescaled, inner):  [{min_x:.6f}-{max_x:.6f}, {min_y:.6f}-{max_y:.6f}], AR = {(max_y - min_y) / (max_x - min_x):.6f}"
         )
 
-        svg = (
-            f'<svg width="{output_size[1]}" height="{output_size[0]}" xmlns="http://www.w3.org/2000/svg" style="background-color: transparent;">'
-            + "".join(svg_lines)
-            + "</svg>"
-        )
+        svg = f'<svg width="{int(output_size[1])}" height="{int(output_size[0])}" xmlns="http://www.w3.org/2000/svg" style="background-color: transparent;">{"".join(svg_lines)}</svg>'
 
         return canvas, svg, all_coords_rescaled, svg
 
@@ -664,8 +1164,15 @@ class Drawing:
 def get_closest_point_on_border(
     coords: Float[Arr, "2"], max_dim_0: int, max_dim_1: int, min_dim_0: int = 0, min_dim_1: int = 0
 ) -> tuple[int, Float[Arr, "2"]]:
-    border_diffs = [max_dim_0 - coords[0], coords[1] - min_dim_1, coords[0] - min_dim_0, max_dim_1 - coords[1]]
-    assert min(border_diffs) >= 0, f"Coords {coords} are out of bounds {min_dim_0}-{max_dim_0}, {min_dim_1}-{max_dim_1}"
+    border_diffs = [
+        max_dim_0 - coords[0],
+        coords[1] - min_dim_1,
+        coords[0] - min_dim_0,
+        max_dim_1 - coords[1],
+    ]
+    assert min(border_diffs) >= 0, (
+        f"Coords {coords} are out of bounds {min_dim_0}-{max_dim_0}, {min_dim_1}-{max_dim_1}"
+    )
     closest_border = np.argmin(border_diffs).item()
     return closest_border, [
         np.array([max_dim_0, coords[1]]),
@@ -748,7 +1255,9 @@ def pad_to_length(arr: np.ndarray, length: int, axis: int = -1, fill_value: floa
     target_shape = list(arr.shape)
     assert length >= target_shape[axis]
     target_shape[axis] = length - target_shape[axis]
-    return np.concatenate([arr, np.full_like(arr, fill_value=fill_value, shape=tuple(target_shape))], axis=axis)
+    return np.concatenate(
+        [arr, np.full_like(arr, fill_value=fill_value, shape=tuple(target_shape))], axis=axis
+    )
 
 
 def FS_dither(
@@ -827,7 +1336,9 @@ def FS_dither_batch(
             color_diff = old_color - color
             row[x_] = color
             row[x_ + 1] += (7 / 16) * color_diff
-            next_row[[x_ - 1, x_, x_ + 1]] += einops.einsum(ABC, color_diff, "three, batch rgb -> three batch rgb")
+            next_row[[x_ - 1, x_, x_ + 1]] += einops.einsum(
+                ABC, color_diff, "three, batch rgb -> three batch rgb"
+            )
 
         # deal with the last pixel in the row
         old_color = row[-1]
@@ -866,7 +1377,9 @@ def FS_dither_batch(
     return image_dithered.astype(np.int32)
 
 
-def _get_min_max_coords(coords: dict[Any, Float[Arr, "2 n_pixels"]]) -> tuple[float, float, float, float]:
+def _get_min_max_coords(
+    coords: dict[Any, Float[Arr, "2 n_pixels"]],
+) -> tuple[float, float, float, float]:
     min_dim_0 = min(coords[:, 0].min().item() for coords in coords.values())
     min_dim_1 = min(coords[:, 1].min().item() for coords in coords.values())
     max_dim_0 = max(coords[:, 0].max().item() for coords in coords.values())
@@ -878,7 +1391,9 @@ def make_gcode(
     all_coords: dict[str, Int[Arr, "n_coords 2"]],
     image_bounding_box: tuple[float, float],  # area we want to place `all_coords` within
     gcode_bounding_box: tuple[float, float],  # drawing area for gcode
-    border_lengths: dict[str, tuple[int, int]],  # amount of pixels we draw with pen-up from start & end of each colour
+    border_lengths: dict[
+        str, tuple[int, int]
+    ],  # amount of pixels we draw with pen-up from start & end of each colour
     margin: float = 0.0,
     tiling: tuple[int, int] = (1, 1),
     speed: int = 10_000,
@@ -912,7 +1427,9 @@ def make_gcode(
 
     # After the flipping and optional rotations, check our bounds are still valid
     all_coords_max = np.max(np.stack([v.max(axis=0) for v in all_coords.values()]), axis=0)
-    assert np.all(all_coords_max <= image_bounding_box), f"Out of bounds: {all_coords_max} > {image_bounding_box}"
+    assert np.all(all_coords_max <= image_bounding_box), (
+        f"Out of bounds: {all_coords_max} > {image_bounding_box}"
+    )
 
     for x_iter in range(tiling[0]):
         for y_iter in range(tiling[1]):
@@ -937,13 +1454,17 @@ def make_gcode(
 
     print()
     for color, times in times_all.items():
-        print(f"{color:<13} ... time = sum({', '.join(f'{t:05.2f}' for t in times)}) = {sum(times):.2f} minutes")
+        print(
+            f"{color:<13} ... time = sum({', '.join(f'{t:05.2f}' for t in times)}) = {sum(times):.2f} minutes"
+        )
 
     if demo:
         for color, gcode in gcode_all.items():
             gcode_all[color] = gcode[:1000]
             gcode_all[color] = [
-                g.replace(f"F{speed}", f"F{int(speed / 2)}") for g in gcode_all[color] if not g.startswith("M3S0")
+                g.replace(f"F{speed}", f"F{int(speed / 2)}")
+                for g in gcode_all[color]
+                if not g.startswith("M3S0")
             ]
 
     if plot_gcode:
@@ -1009,13 +1530,19 @@ def make_gcode_single(
     # Rescale coordinates to fit within GCode bounding box (we scale as large as possible while staying inside it)
     (x0, y0), (x1, y1) = gcode_bounding_box
     sf = min((x1 - x0) / image_bounding_box[0], (y1 - y0) / image_bounding_box[1])
-    all_coords_gcode_scale = {color: np.array([x0, y0]) + coords * sf for color, coords in all_coords.items()}
+    all_coords_gcode_scale = {
+        color: np.array([x0, y0]) + coords * sf for color, coords in all_coords.items()
+    }
 
     # Print new bounding box, in GCode terms (note that we still use the originally provided gcode bounding box
     # rather than cropping further, since we might want the empty space!).
     min_x, min_y, max_x, max_y = _get_min_max_coords(all_coords_gcode_scale)
-    all_coords_gcode_scale["bounding_box"] = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]])
-    print(f"  Bounding box (outer): [{x0:06.2f}-{x1:06.2f}, {y0:06.2f}-{y1:06.2f}], AR = {(y1 - y0) / (x1 - x0):.3f}")
+    all_coords_gcode_scale["bounding_box"] = np.array(
+        [[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]]
+    )
+    print(
+        f"  Bounding box (outer): [{x0:06.2f}-{x1:06.2f}, {y0:06.2f}-{y1:06.2f}], AR = {(y1 - y0) / (x1 - x0):.3f}"
+    )
     print(
         f"  Bounding box (inner): [{min_x:06.2f}-{max_x:06.2f}, {min_y:06.2f}-{max_y:06.2f}], AR = {(max_y - min_y) / (max_x - min_x):.3f}"
     )
@@ -1070,7 +1597,9 @@ def make_gcode_single(
         gcode[color].extend([f"G1 X{x:.3f} Y{y:.3f} F{speed}" for x, y in end_xy_seq])
 
         # Filter GCode to remove any duplicates which are adjacent to each other
-        duplicate_indices = set([i for i, (g0, g1) in enumerate(zip(gcode[color][:-1], gcode[color][1:])) if g0 == g1])
+        duplicate_indices = set(
+            [i for i, (g0, g1) in enumerate(zip(gcode[color][:-1], gcode[color][1:])) if g0 == g1]
+        )
         if duplicate_indices:
             gcode[color] = [g for i, g in enumerate(gcode[color]) if i not in duplicate_indices]
 
@@ -1084,7 +1613,9 @@ def make_gcode_single(
         # print(color, border_start, border_end, border_lengths, len(coords_list))
 
         # Print total time this will take
-        coords_concatenated = np.concatenate([coords for _, coords in all_coords_gcode_scale[color]])
+        coords_concatenated = np.concatenate(
+            [coords for _, coords in all_coords_gcode_scale[color]]
+        )
         distances = np.linalg.norm(np.diff(coords_concatenated, axis=0), axis=1)
         distance_for_one_minute = 1400  # TODO - improve this estimate
         times[color] = distances.sum() / distance_for_one_minute
