@@ -1006,9 +1006,7 @@ class Drawing:
 
     def make_canvas_and_crop_coords(
         self,
-        all_coords: dict[
-            str, Union[Float[Arr, "n_pixels 2"], list[Union[BezierCurve, Circle, PiecewiseLinear]]]
-        ],
+        all_coords: dict[str, list[BezierCurve | Circle | PiecewiseLinear]],
         target_y: int,
         target_x: int,
         bounding_x: tuple[float, float] = (0.0, 1.0),
@@ -1025,7 +1023,8 @@ class Drawing:
 
         output_x = self.target.output_x
         output_y = int(output_x * target_y / target_x)
-        output_sf = output_x / target_x
+        output_sf = self.target.x / target_x
+        # output_sf = output_x / target_x
 
         size = np.array([target_y, target_x]) - 1
         bounding_min = np.array([bounding_y[0], bounding_x[0]])
@@ -1478,6 +1477,8 @@ def make_gcode(
         draw_all = ImageDraw.Draw(canvas_all)
         # for color, all_lines in coords_gcode_scale_all.items():
         for color, gcode in gcode_all.items():
+            if color == "bounding_box" and not use_borders:
+                continue
             all_lines = _create_coords_from_gcode(gcode)
             canvas = Image.new("RGB", (int(output_x), int(output_y)), (255, 255, 255))
             for lines, pen_up in all_lines:
@@ -1487,7 +1488,9 @@ def make_gcode(
                 fill = "#aaa" if pen_up else "black" if color == "bounding_box" else color
                 draw.line(points, fill=fill, width=width)
                 draw_all.line(points, fill=fill, width=width)
-            display(ImageOps.expand(canvas, border=(3, 0, 0, 3), fill="white"))
+            # Only show individual colors if we had more than one
+            if use_borders or (set(gcode_all.keys()) - {"black", "bounding_box"}):
+                display(ImageOps.expand(canvas, border=(3, 0, 0, 3), fill="white"))
         display(ImageOps.expand(canvas_all, border=(3, 0, 0, 3), fill="white"))
 
     return gcode_all
@@ -1657,3 +1660,59 @@ def _create_coords_from_gcode(gcode: list[str]) -> list[tuple[Float[Arr, "length
         segments.append((np.array(coords), pen_up))
 
     return segments
+
+
+def load_coords_from_npz(
+    npz_path: str,
+) -> dict[str, list[BezierCurve | Circle | PiecewiseLinear]]:
+    """
+    Load coordinates from an npz file and convert them back to shape objects.
+
+    Args:
+        npz_path: Path to the npz file
+
+    Returns:
+        Dictionary mapping color strings to lists of shape objects
+    """
+    from drawing import BezierCurve, Circle, PiecewiseLinear
+
+    loaded = np.load(npz_path, allow_pickle=True)
+    all_coords = {}
+
+    for color_string, value in loaded.items():
+        # Handle the nested structure: {color_string: {"shapes": [...]}}
+        if isinstance(value.item(), dict) and "shapes" in value.item():
+            shapes_dict = value.item()["shapes"]
+        else:
+            # Fallback: assume it's already a list
+            shapes_dict = value.item() if hasattr(value, "item") else value
+
+        shape_objects = []
+        for shape_data in shapes_dict:
+            if isinstance(shape_data, dict):
+                shape_type = shape_data.get("type")
+                data = shape_data.get("data", {})
+
+                if shape_type == "BezierCurve":
+                    shape_objects.append(
+                        BezierCurve(
+                            p0=np.array(data["p0"]),
+                            p1=np.array(data["p1"]),
+                            p2=np.array(data["p2"]),
+                            p3=np.array(data["p3"]),
+                        )
+                    )
+                elif shape_type == "Circle":
+                    shape_objects.append(
+                        Circle(center=np.array(data["center"]), radius=data["radius"])
+                    )
+                elif shape_type == "PiecewiseLinear":
+                    shape_objects.append(
+                        PiecewiseLinear(
+                            coords=np.array(data["coords"]).T  # Transpose to (2, n_points)
+                        )
+                    )
+
+        all_coords[color_string] = shape_objects
+
+    return all_coords
